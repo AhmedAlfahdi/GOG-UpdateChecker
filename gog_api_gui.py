@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTreeWidget, QTreeWidgetItem, QTabWidget, QTextEdit, QTextBrowser, QPushButton,
     QLabel, QSplitter, QFrame, QProgressBar, QMessageBox, QHeaderView,
-    QSizePolicy, QSpacerItem, QMenuBar, QMenu
+    QSizePolicy, QSpacerItem, QMenuBar, QMenu, QCheckBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
 from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QAction, QKeySequence
@@ -30,6 +30,80 @@ from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QAction, QKeySequence
 import winreg
 import subprocess
 
+# Version information
+APP_VERSION = "1.2.0"
+GITHUB_REPO = "AhmedAlfahdi/GOG-UpdateChecker"
+UPDATE_CHECK_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+
+class GitHubUpdateChecker:
+    """Class to check for application updates from GitHub releases"""
+    
+    def __init__(self):
+        """Initialize the update checker"""
+        self.current_version = APP_VERSION
+        self.latest_version = None
+        self.download_url = None
+        self.release_notes = None
+        
+    def check_for_updates(self):
+        """Check GitHub for the latest release"""
+        try:
+            request = urllib.request.Request(UPDATE_CHECK_URL)
+            request.add_header('User-Agent', f'GOG-UpdateChecker/{self.current_version}')
+            
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                
+                self.latest_version = data.get('tag_name', '').lstrip('v')
+                self.download_url = data.get('html_url')
+                self.release_notes = data.get('body', 'No release notes available.')
+                
+                return {
+                    'current_version': self.current_version,
+                    'latest_version': self.latest_version,
+                    'update_available': self._is_newer_version(self.latest_version, self.current_version),
+                    'download_url': self.download_url,
+                    'release_notes': self.release_notes
+                }
+                
+        except Exception as e:
+            return {
+                'error': f'Failed to check for updates: {str(e)}',
+                'current_version': self.current_version
+            }
+    
+    def _is_newer_version(self, latest, current):
+        """Compare version strings to determine if an update is available"""
+        try:
+            # Split versions into parts and convert to integers for comparison
+            latest_parts = [int(x) for x in latest.split('.') if x.isdigit()]
+            current_parts = [int(x) for x in current.split('.') if x.isdigit()]
+            
+            # Pad shorter version with zeros
+            max_length = max(len(latest_parts), len(current_parts))
+            latest_parts.extend([0] * (max_length - len(latest_parts)))
+            current_parts.extend([0] * (max_length - len(current_parts)))
+            
+            return latest_parts > current_parts
+        except:
+            # If version parsing fails, compare as strings
+            return latest != current
+
+
+class AppUpdateCheckThread(QThread):
+    """Thread for checking application updates without blocking the UI"""
+    update_checked = Signal(dict)
+    
+    def __init__(self):
+        super().__init__()
+        self.update_checker = GitHubUpdateChecker()
+    
+    def run(self):
+        """Run the update check in background"""
+        result = self.update_checker.check_for_updates()
+        self.update_checked.emit(result)
+
 
 class GOGGameScanner:
     """Scanner class for detecting installed GOG games - reused from original implementation"""
@@ -37,11 +111,10 @@ class GOGGameScanner:
     def __init__(self):
         """Initialize the GOG game scanner"""
         self.found_games = []
+        self.progress_callback = None
         
     def find_gog_galaxy(self):
         """Find GOG Galaxy installation"""
-        print("DEBUG: Searching for GOG Galaxy...")
-        
         # Common GOG Galaxy installation paths
         possible_paths = [
             "C:\\Program Files (x86)\\GOG Galaxy\\GalaxyClient.exe",
@@ -51,7 +124,6 @@ class GOGGameScanner:
         
         for path in possible_paths:
             if os.path.exists(path):
-                print(f"DEBUG: Found GOG Galaxy at: {path}")
                 return path
         
         # Try registry
@@ -60,24 +132,34 @@ class GOGGameScanner:
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\GOG.com\GalaxyClient\paths")
                 client_path = winreg.QueryValueEx(key, "client")[0]
                 if os.path.exists(client_path):
-                    print(f"DEBUG: Found GOG Galaxy via registry: {client_path}")
                     return client_path
             except:
                 pass
         
-        print("DEBUG: GOG Galaxy not found")
         return None
         
-    def find_gog_games(self):
+    def find_gog_games(self, deep_scan=False):
         """Find all installed GOG games"""
-        print("DEBUG: Starting game scan...")
         self.found_games = []
+        
+        if self.progress_callback:
+            scan_type = "Deep Scan" if deep_scan else "Quick Scan"
+            self.progress_callback(f"Starting {scan_type} - Scanning Windows registry...")
         
         # Scan registry
         registry_games = self._scan_registry()
         
+        if self.progress_callback:
+            if deep_scan:
+                self.progress_callback("Deep Scan - Searching all common directories (this may take longer)...")
+            else:
+                self.progress_callback("Quick Scan - Scanning standard game directories...")
+        
         # Scan directories
-        directory_games = self._scan_directories()
+        directory_games = self._scan_directories(deep_scan=deep_scan)
+        
+        if self.progress_callback:
+            self.progress_callback("Processing found games...")
         
         # Combine and deduplicate
         all_games = registry_games + directory_games
@@ -90,19 +172,17 @@ class GOGGameScanner:
         
         self.found_games = list(unique_games.values())
         
-        print(f"DEBUG: Total games found: {len(self.found_games)}")
-        for game in self.found_games:
-            print(f"DEBUG: Game: {game.get('name')} at {game.get('install_path')}")
+        if self.progress_callback:
+            scan_type = "Deep scan" if deep_scan else "Quick scan"
+            self.progress_callback(f"{scan_type} complete - found {len(self.found_games)} games")
         
         return self.found_games
     
     def _scan_registry(self):
         """Scan Windows registry for GOG games"""
-        print("DEBUG: Scanning registry...")
         games = []
         
         if not winreg:
-            print("DEBUG: winreg not available, skipping registry scan")
             return games
         
         registry_paths = [
@@ -112,7 +192,6 @@ class GOGGameScanner:
         
         for registry_path in registry_paths:
             try:
-                print(f"DEBUG: Checking registry path: {registry_path}")
                 with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, registry_path) as key:
                     gog_keys = []
                     
@@ -126,18 +205,14 @@ class GOGGameScanner:
                     except WindowsError:
                         pass
                     
-                    print(f"DEBUG: Found {len(gog_keys)} GOG keys in {registry_path}")
-                    
                     for gog_key in gog_keys:
                         game_info = self._extract_game_info_from_registry(key, gog_key)
                         if game_info:
                             games.append(game_info)
                             
-            except Exception as e:
-                print(f"DEBUG: Error scanning registry path {registry_path}: {e}")
+            except Exception:
                 continue
         
-        print(f"DEBUG: Registry scan found {len(games)} games")
         return games 
     
     def _extract_game_info_from_registry(self, parent_key, game_key):
@@ -188,82 +263,145 @@ class GOGGameScanner:
             return None
     
     def _clean_version_string(self, version_str):
-        """Clean and validate version string from registry"""
+        """Clean and validate version string"""
         if not version_str:
             return None
         
         version_str = str(version_str).strip()
+        
+        # Remove common prefixes
         prefixes = ['v', 'ver', 'version', 'rel', 'release']
         for prefix in prefixes:
             if version_str.lower().startswith(prefix):
                 version_str = version_str[len(prefix):].strip('.: ')
                 break
         
-        return self._extract_version_from_text(version_str)
+        # Remove trailing zeros in X.Y.Z.0 format
+        parts = version_str.split('.')
+        while len(parts) > 2 and parts[-1] == '0':
+            parts.pop()
+        
+        clean_version = '.'.join(parts)
+        return clean_version if self._is_valid_version(clean_version) else None
     
-    def _scan_directories(self):
+    def _scan_directories(self, deep_scan=False):
         """Scan common directories for GOG games"""
-        print("DEBUG: Scanning directories...")
         games = []
         
-        # Common GOG installation directories
-        search_paths = [
-            "C:\\Program Files (x86)\\GOG Games",
-            "C:\\Program Files\\GOG Games",
-            "C:\\GOG Games",
-            "D:\\GOG Games",
-            "E:\\GOG Games",
-            "F:\\GOG Games",
-            "G:\\GOG Games",
-            "C:\\Games\\GOG",
-            "D:\\Games\\GOG",
-            "E:\\Games\\GOG",
-            "C:\\Program Files\\GOG Games",
-            "C:\\Program Files (x86)\\GOG Games",
-            "D:\\Program Files\\GOG Games",
-            "D:\\Program Files (x86)\\GOG Games",
-            "C:\\Games",
-            "D:\\Games",
-            "E:\\Games",
-            f"C:\\Users\\{os.getenv('USERNAME', 'User')}\\Games\\GOG",
-            f"C:\\Users\\{os.getenv('USERNAME', 'User')}\\Documents\\GOG Games",
-            "D:",
-            "E:",
-            "F:"
-        ]
+        if deep_scan:
+            # Deep scan: check all common drive letters and directories
+            search_paths = self._get_deep_scan_paths()
+        else:
+            # Quick scan: most common GOG installation directories (optimized for speed)
+            search_paths = [
+                "C:\\Program Files (x86)\\GOG Games",
+                "C:\\Program Files\\GOG Games", 
+                "C:\\GOG Games",
+                "D:\\GOG Games",
+                "C:\\Games\\GOG",
+                "D:\\Games\\GOG",
+                "C:\\Games",
+                "D:\\Games"
+            ]
         
-        for path in search_paths:
-            print(f"DEBUG: Checking directory: {path}")
+        total_paths = len(search_paths)
+        for i, path in enumerate(search_paths):
+            if self.progress_callback and deep_scan:
+                progress_percent = (i / total_paths) * 100
+                self.progress_callback(f"Deep Scan - Checking directory {i+1}/{total_paths}: {path[:50]}{'...' if len(path) > 50 else ''}")
+            
             if os.path.exists(path):
-                print(f"DEBUG: Directory exists: {path}")
                 try:
                     items = os.listdir(path)
-                    print(f"DEBUG: Found {len(items)} items in {path}")
                     
                     for item in items:
                         item_path = os.path.join(path, item)
                         if os.path.isdir(item_path):
                             if self._is_gog_game_directory(item_path):
-                                print(f"DEBUG: Found GOG metadata file: {self._find_gog_metadata(item_path)}")
-                                print(f"DEBUG: Analyzing potential GOG game: {item_path}")
                                 game_info = self._analyze_game_directory(item_path, item)
                                 if game_info:
-                                    print(f"DEBUG: Successfully identified GOG game: {game_info['name']}")
                                     games.append(game_info)
-                            else:
-                                # Check for access errors
-                                try:
-                                    os.listdir(item_path)
-                                except Exception as e:
-                                    print(f"DEBUG: Error checking directory {item_path}: {e}")
                                     
-                except Exception as e:
-                    print(f"DEBUG: Error scanning directory {path}: {e}")
-            else:
-                print(f"DEBUG: Directory does not exist: {path}")
-        
-        print(f"DEBUG: Directory scan found {len(games)} games")
+                except Exception:
+                    pass
         return games
+    
+    def _get_deep_scan_paths(self):
+        """Get comprehensive list of directories for deep scan"""
+        import string
+        
+        search_paths = []
+        
+        # Check all available drive letters
+        available_drives = []
+        for drive_letter in string.ascii_uppercase:
+            drive_path = f"{drive_letter}:\\"
+            if os.path.exists(drive_path):
+                available_drives.append(drive_letter)
+        
+        # Common directory patterns for each drive
+        common_patterns = [
+            "\\Program Files (x86)\\GOG Games",
+            "\\Program Files\\GOG Games",
+            "\\GOG Games",
+            "\\Games\\GOG",
+            "\\Games\\GOG Games",
+            "\\Games",
+            "\\Gaming\\GOG",
+            "\\Gaming\\GOG Games",
+            "\\Steam\\steamapps\\common",  # Sometimes GOG games are moved here
+            "\\Epic Games\\",
+            "\\GOG.com",
+            "\\Software\\GOG",
+            "\\Applications\\GOG",
+            "\\Programs\\GOG"
+        ]
+        
+        # User-specific directories
+        username = os.getenv('USERNAME', 'User')
+        user_patterns = [
+            f"\\Users\\{username}\\Documents\\GOG Games",
+            f"\\Users\\{username}\\Games\\GOG",
+            f"\\Users\\{username}\\Games",
+            f"\\Users\\{username}\\Desktop\\GOG Games",
+            f"\\Users\\{username}\\Downloads\\GOG Games",
+            f"\\Users\\{username}\\AppData\\Local\\GOG.com\\Galaxy\\Games",
+            f"\\Users\\{username}\\AppData\\Roaming\\GOG.com\\Galaxy\\Games"
+        ]
+        
+        # Build complete path list
+        for drive in available_drives:
+            # Add common patterns
+            for pattern in common_patterns:
+                search_paths.append(f"{drive}:{pattern}")
+            
+            # Add user-specific patterns (only for C: drive to avoid duplicates)
+            if drive == 'C':
+                for pattern in user_patterns:
+                    search_paths.append(f"{drive}:{pattern}")
+        
+        # Add some absolute paths that might exist
+        additional_paths = [
+            "C:\\Program Files (x86)\\GOG.com\\Games",
+            "C:\\Program Files\\GOG.com\\Games", 
+            "C:\\ProgramData\\GOG.com\\Galaxy\\Games",
+            "D:\\Steam\\steamapps\\common",
+            "E:\\Games",
+            "F:\\Games",
+            "G:\\Games"
+        ]
+        
+        search_paths.extend(additional_paths)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_paths = []
+        for path in search_paths:
+            if path not in seen:
+                seen.add(path)
+                unique_paths.append(path)
+        
+        return unique_paths
     
     def _find_gog_metadata(self, directory):
         """Find GOG metadata file in directory"""
@@ -408,25 +546,54 @@ class GOGGameScanner:
         if not text:
             return None
             
+        # Enhanced patterns for version detection
         patterns = [
+            # Standard version patterns
             r'version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
             r'v\.?\s*([0-9]+(?:\.[0-9]+)+)',
-            r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)',
-            r'([0-9]+\.[0-9]+\.[0-9]+)',
-            r'([0-9]+\.[0-9]+)',
-            r'build\s*[:=]\s*([0-9]+)',
+            r'ver\.?\s*([0-9]+(?:\.[0-9]+)+)',
+            # Specific version formats
+            r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)',  # X.Y.Z.W
+            r'([0-9]+\.[0-9]+\.[0-9]+)',          # X.Y.Z
+            r'([0-9]+\.[0-9]+)',                  # X.Y (only if reasonable)
+            # Build/release patterns
+            r'build\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
             r'release\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            r'rev\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            r'revision\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            # Game-specific patterns
+            r'game\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            r'client\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            r'app\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            # Generic number patterns (more specific)
+            r'\b([0-9]{1,2}\.[0-9]{1,3}\.[0-9]{1,4})\b',  # Bounded version numbers
         ]
         
         text_lower = text.lower()
         
+        # Try each pattern and validate results
         for pattern in patterns:
-            match = re.search(pattern, text_lower, re.IGNORECASE)
-            if match:
-                version = match.group(1)
+            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+            for match in matches:
+                version = match.strip()
+                print(f"DEBUG _extract_version_from_text: Found potential version '{version}' with pattern '{pattern}'")
+                
                 if self._is_valid_version(version):
+                    # Additional check for X.Y format - should be reasonable numbers
+                    parts = version.split('.')
+                    if len(parts) == 2:
+                        try:
+                            major, minor = int(parts[0]), int(parts[1])
+                            # Only accept X.Y if numbers seem reasonable for a version
+                            if major > 20 or minor > 999:  # Probably not a version
+                                continue
+                        except ValueError:
+                            continue
+                    
+                    print(f"DEBUG _extract_version_from_text: Accepting version '{version}'")
                     return version
         
+        print(f"DEBUG _extract_version_from_text: No valid version found in text")
         return None
     
     def _is_valid_version(self, version):
@@ -473,18 +640,31 @@ class GameScanThread(QThread):
     """Thread for scanning games without blocking the UI"""
     games_found = Signal(list)
     log_message = Signal(str)
+    scan_progress = Signal(str)  # New signal for scan progress updates
     
-    def __init__(self):
+    def __init__(self, deep_scan=False):
         super().__init__()
         self.scanner = GOGGameScanner()
+        self.deep_scan = deep_scan
     
     def run(self):
         """Run the game scanning in a separate thread"""
         try:
-            self.log_message.emit("🔄 Starting game scan...")
-            games = self.scanner.find_gog_games()
+            scan_type = "deep scan" if self.deep_scan else "quick scan"
+            self.log_message.emit(f"🔄 Starting {scan_type}...")
+            self.scan_progress.emit("Initializing scan...")
+            
+            if self.deep_scan:
+                self.log_message.emit("⚠️ Deep scan enabled - this will take longer but finds more games")
+            
+            # Connect scanner progress to our signals
+            self.scanner.progress_callback = self.scan_progress.emit
+            
+            games = self.scanner.find_gog_games(deep_scan=self.deep_scan)
             self.games_found.emit(games)
-            self.log_message.emit(f"✅ Scan completed! Found {len(games)} games")
+            
+            scan_type_caps = "Deep scan" if self.deep_scan else "Quick scan" 
+            self.log_message.emit(f"✅ {scan_type_caps} completed! Found {len(games)} games")
         except Exception as e:
             self.log_message.emit(f"❌ Error during scan: {str(e)}")
 
@@ -494,6 +674,8 @@ class UpdateCheckThread(QThread):
     update_progress = Signal(dict)
     log_message = Signal(str)
     finished = Signal()
+    progress_update = Signal(int, str)  # New signal for progress updates
+    network_error_detected = Signal()  # Signal for network connectivity issues
     
     def __init__(self, games):
         super().__init__()
@@ -508,10 +690,16 @@ class UpdateCheckThread(QThread):
                 game_name = game.get('name', '')
                 install_path = game.get('install_path', '')
                 
+                # Emit progress update
+                self.progress_update.emit(i, f"Analyzing {game_name}")
+                
                 self.log_message.emit(f"🎮 Checking: {game_name}")
                 
                 # Detect version from GOG files
                 detected_version = self.detect_version_from_gog_files(install_path)
+                
+                # Detect readable version (like 1.2.26) separately from build ID
+                readable_version = self.detect_readable_version_from_gog_files(install_path)
                 
                 # Extract actual GOG ID for API calls
                 actual_gog_id = None
@@ -530,7 +718,15 @@ class UpdateCheckThread(QThread):
                     game['installed_version'] = detected_version
                     if actual_gog_id:
                         game['gog_id'] = actual_gog_id
-                    
+                
+                # Store the readable version separately
+                game['readable_version'] = readable_version if readable_version else '-'
+                
+                # If no readable version found, try to get it from GOGDB later
+                if not readable_version and actual_gog_id:
+                    self.log_message.emit(f"   📋 Will attempt to get version from GOGDB for GOG ID: {actual_gog_id}")
+                
+                if detected_version:
                     if detected_version.isdigit() and len(detected_version) >= 8:
                         self.log_message.emit(f"   🎯 Found Build ID: {detected_version}")
                     else:
@@ -539,18 +735,26 @@ class UpdateCheckThread(QThread):
                     self.log_message.emit(f"   ❌ Could not detect version/build ID")
                 
                 # Get latest version info from APIs
+                self.progress_update.emit(i, f"Fetching data for {game_name}")
                 self.log_message.emit(f"   🌐 Fetching from GOG Database API...")
                 api_id = actual_gog_id if actual_gog_id else detected_version
                 self.log_message.emit(f"   🔧 Using API ID: {api_id} (actual_gog_id: {actual_gog_id}, detected_version: {detected_version})")
                 version_info = self.get_latest_version_info(game_name, api_id)
                 
-                time.sleep(1)  # Rate limiting
+                time.sleep(0.3)  # Reduced rate limiting for faster processing
                 
                 if version_info and 'error' not in version_info:
                     game['latest_version'] = version_info.get('latest_version', 'Unknown')
                     game['changelog'] = version_info.get('changelog', 'No changelog available')
                     game['tags'] = version_info.get('tags', '🎮')
                     source = version_info.get('source', 'unknown')
+                    
+                    # If we didn't find a readable version locally, try to use the one from API
+                    if game['readable_version'] == '-':
+                        api_readable_version = version_info.get('readable_version')
+                        if api_readable_version:
+                            game['readable_version'] = api_readable_version
+                            self.log_message.emit(f"   🎯 Got readable version from API: {api_readable_version}")
                     
                     # Compare versions
                     installed_version = game.get('installed_version', 'Unknown')
@@ -610,7 +814,11 @@ class UpdateCheckThread(QThread):
                     game['latest_version'] = 'Unknown'
                     game['changelog'] = 'Changelog not available'
                 
+                # Keep readable version as dash if no real version found - don't use build IDs
+                # The "Installed Version" column should only show actual version numbers, not build IDs
+                
                 # Emit progress update
+                self.progress_update.emit(i + 1, f"Completed {game_name}")
                 self.update_progress.emit(game.copy())
                 self.log_message.emit(f"   ✅ Completed check for {game_name}\n")
             
@@ -627,41 +835,324 @@ class UpdateCheckThread(QThread):
             if not install_path or not os.path.exists(install_path):
                 return None
             
-            for file in os.listdir(install_path):
-                if file.lower().startswith('goggame-') and file.lower().endswith('.info'):
-                    match = re.search(r'goggame-(\d+)\.info', file.lower())
-                    if match:
-                        gog_id = match.group(1)
-                        info_path = os.path.join(install_path, file)
-                        
-                        # Parse file for build ID
-                        try:
-                            with open(info_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                content = f.read()
-                            
-                            # Look for build ID patterns
-                            build_id_patterns = [
-                                r'"buildId"\s*:\s*"([^"]+)"',
-                                r'"build_id"\s*:\s*"([^"]+)"',
-                                r'"build"\s*:\s*"([^"]+)"'
-                            ]
-                            
-                            for pattern in build_id_patterns:
-                                match = re.search(pattern, content, re.IGNORECASE)
-                                if match:
-                                    build_id = match.group(1).strip('"\'')
-                                    if build_id and build_id.isdigit() and len(build_id) >= 8:
-                                        return build_id
-                            
-                            # Fallback to GOG ID
-                            return gog_id
-                            
-                        except:
-                            return gog_id
+            # Cache for build ID detection too
+            if hasattr(self, '_build_id_cache') and install_path in self._build_id_cache:
+                return self._build_id_cache[install_path]
             
+            if not hasattr(self, '_build_id_cache'):
+                self._build_id_cache = {}
+            
+            # Get all .info files and just use the first one for speed
+            info_files = [f for f in os.listdir(install_path) if f.lower().startswith('goggame-') and f.lower().endswith('.info')]
+            if info_files:
+                file = info_files[0]  # Just check the first one
+                match = re.search(r'goggame-(\d+)\.info', file.lower())
+                if match:
+                    gog_id = match.group(1)
+                    info_path = os.path.join(install_path, file)
+                    
+                    # Parse file for build ID
+                    try:
+                        with open(info_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read(500)  # Read only first 500 chars for speed
+                        
+                        # Look for build ID patterns
+                        build_id_pattern = r'"buildId"\s*:\s*"([^"]+)"'  # Most common pattern first
+                        match = re.search(build_id_pattern, content, re.IGNORECASE)
+                        if match:
+                            build_id = match.group(1).strip('"\'')
+                            if build_id and build_id.isdigit() and len(build_id) >= 8:
+                                self._build_id_cache[install_path] = build_id
+                                return build_id
+                        
+                        # Quick fallback to GOG ID
+                        self._build_id_cache[install_path] = gog_id
+                        return gog_id
+                        
+                    except:
+                        self._build_id_cache[install_path] = gog_id
+                        return gog_id
+            
+            self._build_id_cache[install_path] = None
             return None
         except:
             return None
+    
+    def detect_readable_version_from_gog_files(self, install_path):
+        """Detect readable version (like 1.2.26) from GOG metadata files"""
+        try:
+            if not install_path or not os.path.exists(install_path):
+                return None
+            
+            # Cache for this path to avoid re-scanning
+            if hasattr(self, '_version_cache') and install_path in self._version_cache:
+                return self._version_cache[install_path]
+            
+            if not hasattr(self, '_version_cache'):
+                self._version_cache = {}
+            
+            # Check GOG metadata files first (only check first .info file for speed)
+            info_files = [f for f in os.listdir(install_path) if f.lower().startswith('goggame-') and f.lower().endswith('.info')]
+            if info_files:
+                info_path = os.path.join(install_path, info_files[0])  # Just check the first one
+                
+                try:
+                    with open(info_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(1000)  # Read only first 1000 chars for speed
+                    
+                    # Look for version patterns (prioritize readable versions over build IDs)
+                    version_patterns = [
+                        # Standard JSON patterns - most common first
+                        r'"version"\s*:\s*"([^"]+)"',
+                        r'"versionName"\s*:\s*"([^"]+)"',
+                        r'"productVersion"\s*:\s*"([^"]+)"',
+                        # Alternative formats
+                        r'version[:\s=]+([0-9]+(?:\.[0-9]+)+)',
+                        # Quick pattern for X.Y.Z
+                        r'([0-9]+\.[0-9]+\.[0-9]+)',
+                    ]
+                    
+                    for pattern in version_patterns:
+                        matches = re.findall(pattern, content, re.IGNORECASE)
+                        for match in matches:
+                            version = match.strip('"\'')
+                            # Check if it looks like a readable version (not a build ID)
+                            if version and not (version.isdigit() and len(version) >= 8):
+                                # Quick validation for version-like strings
+                                if self._is_valid_version(version):
+                                    self._version_cache[install_path] = version
+                                    return version
+                    
+                except Exception:
+                    pass
+            
+            # Check for version in game executable files (only if no version found in metadata)
+            try:
+                exe_files = [f for f in os.listdir(install_path) if f.endswith('.exe') and not f.lower().startswith(('unins', 'setup', 'install', 'crash', 'error', 'redist'))]
+                if exe_files:
+                    exe_path = os.path.join(install_path, exe_files[0])  # Check only the first main executable
+                    version = self._get_exe_version(exe_path)
+                    if version:
+                        self._version_cache[install_path] = version
+                        return version
+            except Exception:
+                pass
+            
+            # Quick fallback: Check only the most common version files
+            quick_check_files = ['version.txt', 'VERSION']
+            for config_file in quick_check_files:
+                config_path = os.path.join(install_path, config_file)
+                if os.path.exists(config_path):
+                    try:
+                        with open(config_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read(500)  # Read only first 500 chars
+                        
+                        version = self._extract_version_from_text(content)
+                        if version and self._is_valid_version(version):
+                            self._version_cache[install_path] = version
+                            return version
+                    except:
+                        continue
+            
+            # Cache the "not found" result to avoid re-scanning
+            self._version_cache[install_path] = None
+            return None
+            
+        except Exception as e:
+            print(f"DEBUG: Exception in version detection: {e}")
+            return None
+    
+    def _looks_like_version(self, text):
+        """Check if text looks like a version number"""
+        if not text:
+            return False
+        
+        # Must contain at least one dot
+        if '.' not in text:
+            return False
+        
+        # Should start with a number
+        if not text[0].isdigit():
+            return False
+        
+        # Should be reasonable length (versions are typically 3-15 chars)
+        if len(text) < 3 or len(text) > 15:
+            return False
+        
+        # Check if it follows version pattern (numbers and dots, maybe some letters)
+        import re
+        if re.match(r'^[0-9]+(?:\.[0-9]+)+(?:[a-zA-Z].*)?$', text):
+            return True
+        
+        return False
+    
+    def _get_exe_version(self, exe_path):
+        """Try to get version from Windows executable file properties"""
+        try:
+            # Try to use win32api if available
+            try:
+                import win32api
+                import win32con
+                
+                # Get file version info
+                info = win32api.GetFileVersionInfo(exe_path, "\\")
+                ms = info['FileVersionMS']
+                ls = info['FileVersionLS']
+                
+                # Extract version components
+                version = f"{win32api.HIWORD(ms)}.{win32api.LOWORD(ms)}.{win32api.HIWORD(ls)}.{win32api.LOWORD(ls)}"
+                
+                # Clean up version (remove trailing .0s)
+                parts = version.split('.')
+                while len(parts) > 2 and parts[-1] == '0':
+                    parts.pop()
+                
+                clean_version = '.'.join(parts)
+                if clean_version != "0.0":
+                    print(f"DEBUG: Extracted version from PE: {clean_version}")
+                    return clean_version
+                    
+            except ImportError:
+                print("DEBUG: win32api not available, trying alternative method")
+                pass
+            except Exception as e:
+                print(f"DEBUG: win32api failed: {e}")
+                pass
+            
+            # Alternative method using subprocess and PowerShell
+            try:
+                import subprocess
+                
+                # Use PowerShell to get file version
+                ps_command = f'''
+                $file = Get-Item "{exe_path}"
+                if ($file.VersionInfo.FileVersion) {{
+                    $file.VersionInfo.FileVersion
+                }} elseif ($file.VersionInfo.ProductVersion) {{
+                    $file.VersionInfo.ProductVersion
+                }}
+                '''
+                
+                result = subprocess.run(
+                    ['powershell', '-Command', ps_command],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    version = result.stdout.strip()
+                    if version and version != "0.0.0.0":
+                                                 # Clean up version
+                        clean_version = self._clean_version_string_thread(version)
+                        if clean_version and self._is_valid_version(clean_version):
+                            print(f"DEBUG: Extracted version from PowerShell: {clean_version}")
+                            return clean_version
+                
+            except Exception as e:
+                print(f"DEBUG: PowerShell method failed: {e}")
+                pass
+            
+            return None
+            
+        except Exception as e:
+            print(f"DEBUG: All version extraction methods failed: {e}")
+            return None
+    
+    def _clean_version_string_thread(self, version_str):
+        """Clean and validate version string for thread use"""
+        if not version_str:
+            return None
+        
+        version_str = str(version_str).strip()
+        
+        # Remove common prefixes
+        prefixes = ['v', 'ver', 'version', 'rel', 'release']
+        for prefix in prefixes:
+            if version_str.lower().startswith(prefix):
+                version_str = version_str[len(prefix):].strip('.: ')
+                break
+        
+        # Remove trailing zeros in X.Y.Z.0 format
+        parts = version_str.split('.')
+        while len(parts) > 2 and parts[-1] == '0':
+            parts.pop()
+        
+        clean_version = '.'.join(parts)
+        return clean_version if self._is_valid_version(clean_version) else None
+    
+    def _extract_version_from_text(self, text):
+        """Extract version number from text using various patterns"""
+        if not text:
+            return None
+            
+        # Enhanced patterns for version detection
+        patterns = [
+            # Standard version patterns
+            r'version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            r'v\.?\s*([0-9]+(?:\.[0-9]+)+)',
+            r'ver\.?\s*([0-9]+(?:\.[0-9]+)+)',
+            # Specific version formats
+            r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)',  # X.Y.Z.W
+            r'([0-9]+\.[0-9]+\.[0-9]+)',          # X.Y.Z
+            r'([0-9]+\.[0-9]+)',                  # X.Y (only if reasonable)
+            # Build/release patterns
+            r'build\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            r'release\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            r'rev\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            r'revision\s*[:=]\s*([0-9]+(?:\.[0-9]+)*)',
+            # Game-specific patterns
+            r'game\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            r'client\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            r'app\s*version\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)',
+            # Generic number patterns (more specific)
+            r'\b([0-9]{1,2}\.[0-9]{1,3}\.[0-9]{1,4})\b',  # Bounded version numbers
+        ]
+        
+        text_lower = text.lower()
+        
+        # Try each pattern and validate results
+        for pattern in patterns:
+            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+            for match in matches:
+                version = match.strip()
+                print(f"DEBUG _extract_version_from_text: Found potential version '{version}' with pattern '{pattern}'")
+                
+                if self._is_valid_version(version):
+                    # Additional check for X.Y format - should be reasonable numbers
+                    parts = version.split('.')
+                    if len(parts) == 2:
+                        try:
+                            major, minor = int(parts[0]), int(parts[1])
+                            # Only accept X.Y if numbers seem reasonable for a version
+                            if major > 20 or minor > 999:  # Probably not a version
+                                continue
+                        except ValueError:
+                            continue
+                    
+                    print(f"DEBUG _extract_version_from_text: Accepting version '{version}'")
+                    return version
+        
+        print(f"DEBUG _extract_version_from_text: No valid version found in text")
+        return None
+    
+    def _is_valid_version(self, version):
+        """Validate if a version string looks reasonable"""
+        if not version:
+            return False
+        
+        parts = version.split('.')
+        if len(parts) > 5 or len(parts) < 1:
+            return False
+        
+        try:
+            nums = [int(p) for p in parts]
+            if any(n > 9999 for n in nums):
+                return False
+            return True
+        except ValueError:
+            return False
     
     def get_latest_version_info(self, game_name, gog_id=None):
         """Get latest version info from APIs with multiple fallbacks"""
@@ -741,14 +1232,40 @@ class UpdateCheckThread(QThread):
                     
                     builds = data.get('builds', [])
                     if builds:
-                        latest_build = builds[-1]
+                        # Filter builds by current OS
+                        current_os = self.get_current_os()
+                        self.log_message.emit(f"   🖥️ Current OS detected: {current_os}")
+                        
+                        # Filter builds for current OS
+                        os_builds = self.filter_builds_by_os(builds, current_os)
+                        
+                        if os_builds:
+                            latest_build = os_builds[-1]  # Get latest build for current OS
+                            self.log_message.emit(f"   📋 Found {len(os_builds)} builds for {current_os}, using latest build ID: {latest_build.get('id', '')}")
+                        else:
+                            # Fallback to latest build overall if no OS-specific build found
+                            latest_build = builds[-1]
+                            self.log_message.emit(f"   ⚠️ No {current_os} builds found, falling back to latest overall build: {latest_build.get('id', '')}")
+                        
                         version = latest_build.get('version', 'Unknown')
                         build_id = latest_build.get('id', '')
+                        
+                        # Try to extract a readable version from the API data
+                        readable_api_version = None
+                        
+                        # Check if version field contains a readable version
+                        if version and version != 'Unknown' and not (str(version).isdigit() and len(str(version)) >= 8):
+                            readable_api_version = str(version)
+                        
+                        # Also check product-level version info
+                        product_version = data.get('version', None)
+                        if product_version and not (str(product_version).isdigit() and len(str(product_version)) >= 8):
+                            readable_api_version = str(product_version)
                         
                         # Extract tags information from product data
                         tags_info = self.extract_tags_from_data(data, gog_id)
                         
-                        self.log_message.emit(f"   📋 Found {len(builds)} builds, latest: {build_id}")
+                        self.log_message.emit(f"   📋 Total builds available: {len(builds)}, selected build: {build_id}")
                         
                         if build_id and str(build_id).isdigit() and len(str(build_id)) >= 8:
                             latest_version = str(build_id)
@@ -762,6 +1279,11 @@ class UpdateCheckThread(QThread):
                             if version and version != 'Unknown':
                                 changelog += f"\nVersion: {version}"
                             
+                            # Add OS information
+                            build_os = latest_build.get('os', 'Unknown')
+                            if build_os != 'Unknown':
+                                changelog += f"\nPlatform: {build_os}"
+                            
                             # For DLCs, mention they share the base game's build ID
                             if is_dlc:
                                 changelog += f"\n\nNote: This DLC/Expansion shares the build ID with the base game '{base_game_name}'"
@@ -772,7 +1294,8 @@ class UpdateCheckThread(QThread):
                             'build_id': build_id,
                             'tags': tags_info,
                             'source': 'gogdb.org',
-                            'base_game': base_game_name if is_dlc else game_name
+                            'base_game': base_game_name if is_dlc else game_name,
+                            'readable_version': readable_api_version  # Add the readable version if found
                         }
                     else:
                         self.log_message.emit(f"   ⚠️ GOGDB API returned no builds for GOG ID {gog_id}")
@@ -785,10 +1308,62 @@ class UpdateCheckThread(QThread):
                 self.log_message.emit(f"   ℹ️ GOG ID {gog_id} not found in GOGDB database")
         except urllib.error.URLError as e:
             self.log_message.emit(f"   ❌ GOGDB API Network Error: {e.reason}")
+            # Signal network issue detected
+            if hasattr(self, 'network_error_detected'):
+                self.network_error_detected.emit()
         except Exception as e:
             self.log_message.emit(f"   ❌ GOGDB API Unexpected Error: {str(e)}")
         
         return None
+    
+    def get_current_os(self):
+        """Detect the current operating system"""
+        import platform
+        system = platform.system().lower()
+        
+        if system == 'windows':
+            return 'windows'
+        elif system == 'darwin':
+            return 'osx'  # GOG/GOGDB typically uses 'osx' for macOS
+        elif system == 'linux':
+            return 'linux'
+        else:
+            return 'windows'  # Default fallback to Windows
+    
+    def filter_builds_by_os(self, builds, target_os):
+        """Filter builds by operating system"""
+        filtered_builds = []
+        
+        for build in builds:
+            # Check various possible OS field names in the build data
+            build_os = None
+            
+            # Try different field names that might contain OS information
+            for os_field in ['os', 'platform', 'operating_system', 'system']:
+                if os_field in build:
+                    build_os = str(build[os_field]).lower()
+                    break
+            
+            # If no OS field found, check if there are OS-specific files or installers
+            if not build_os and 'files' in build:
+                files = build.get('files', [])
+                for file_info in files:
+                    if isinstance(file_info, dict):
+                        file_os = file_info.get('os', '').lower()
+                        if file_os:
+                            build_os = file_os
+                            break
+            
+            # Match OS with some flexibility for naming variations
+            if build_os:
+                if target_os == 'windows' and any(win_variant in build_os for win_variant in ['windows', 'win', 'pc']):
+                    filtered_builds.append(build)
+                elif target_os == 'osx' and any(mac_variant in build_os for mac_variant in ['osx', 'mac', 'macos', 'darwin']):
+                    filtered_builds.append(build)
+                elif target_os == 'linux' and 'linux' in build_os:
+                    filtered_builds.append(build)
+        
+        return filtered_builds
     
     def extract_tags_from_data(self, product_data, gog_id):
         """Extract tags information from GOGDB product data"""
@@ -943,6 +1518,13 @@ class MainWindow(QMainWindow):
         self.installed_games = []
         self.scan_thread = None
         self.update_thread = None
+        self.app_update_thread = None
+        
+        # Progress tracking
+        self.progress_start_time = None
+        self.progress_total_items = 0
+        self.progress_completed_items = 0
+        self.current_operation = "idle"  # Track current operation phase
         
         # Font size management
         self.settings = QSettings("GOGTools", "BuildIDChecker")
@@ -964,6 +1546,13 @@ class MainWindow(QMainWindow):
         # Update theme menu checks after everything is initialized
         if hasattr(self, 'follow_system_action'):
             self.update_theme_menu_checks()
+        
+        # Check for app updates on startup (if enabled)
+        check_updates_on_startup = self.settings.value("check_updates_on_startup", True, type=bool)
+        if check_updates_on_startup:
+            # Delay the update check by 2 seconds to let the UI fully load
+            QTimer.singleShot(2000, self.check_app_updates_silent)
+        
         self.auto_scan()
     
     def init_ui(self):
@@ -1040,8 +1629,12 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        controls_layout = QHBoxLayout(controls_frame)
+        controls_layout = QVBoxLayout(controls_frame)
         controls_layout.setSpacing(10)
+        
+        # First row: Main buttons
+        buttons_layout = QHBoxLayout()
+        buttons_layout.setSpacing(10)
         
         # Scan button
         self.scan_button = QPushButton("🔍 Scan Games")
@@ -1098,18 +1691,58 @@ class MainWindow(QMainWindow):
         for button in [self.scan_button, self.update_button, self.refresh_button, self.galaxy_button, self.help_button]:
             button.setStyleSheet(button_style)
         
-        # Add buttons to layout
-        controls_layout.addWidget(self.scan_button)
-        controls_layout.addWidget(self.update_button)
-        controls_layout.addWidget(self.refresh_button)
-        controls_layout.addWidget(self.galaxy_button)
-        controls_layout.addWidget(self.help_button)
-        controls_layout.addStretch()
+        # Add buttons to first row
+        buttons_layout.addWidget(self.scan_button)
+        buttons_layout.addWidget(self.update_button)
+        buttons_layout.addWidget(self.refresh_button)
+        buttons_layout.addWidget(self.galaxy_button)
+        buttons_layout.addWidget(self.help_button)
+        buttons_layout.addStretch()
         
         # Statistics labels
         self.stats_label = QLabel("Ready to scan")
         self.stats_label.setStyleSheet("color: #ECF0F1; font-size: 12px; font-weight: bold;")
-        controls_layout.addWidget(self.stats_label)
+        buttons_layout.addWidget(self.stats_label)
+        
+        # Second row: Deep scan checkbox and options
+        options_layout = QHBoxLayout()
+        options_layout.setSpacing(10)
+        
+        # Deep scan checkbox
+        self.deep_scan_checkbox = QCheckBox("🔍 Deep Scan (slower but finds more games)")
+        self.deep_scan_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #ECF0F1;
+                font-size: 11px;
+                padding: 5px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #5D6D7E;
+                border-radius: 3px;
+                background-color: #34495E;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #3498DB;
+                border-color: #2980B9;
+            }
+            QCheckBox::indicator:checked:hover {
+                background-color: #2980B9;
+            }
+        """)
+        self.deep_scan_checkbox.setToolTip(
+            "Deep Scan searches all common drive letters and game directories.\n"
+            "This takes longer but finds games in non-standard locations.\n"
+            "Quick Scan only checks the most common GOG game directories."
+        )
+        
+        options_layout.addWidget(self.deep_scan_checkbox)
+        options_layout.addStretch()
+        
+        # Add both rows to the main layout
+        controls_layout.addLayout(buttons_layout)
+        controls_layout.addLayout(options_layout)
         
         parent_layout.addWidget(controls_frame)
     
@@ -1166,6 +1799,7 @@ class MainWindow(QMainWindow):
         self.games_tree = QTreeWidget()
         self.games_tree.setHeaderLabels([
             "Game Name", 
+            "Installed Version",
             "Installed Build/Version", 
             "Latest Build/Version", 
             "Status", 
@@ -1325,6 +1959,56 @@ class MainWindow(QMainWindow):
                 font-size: 11px;
             }
         """)
+        
+        # Create progress bar for the bottom right
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMaximumHeight(16)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #5D6D7E;
+                border-radius: 3px;
+                background-color: #2C3E50;
+                text-align: center;
+                font-size: 10px;
+                color: #ECF0F1;
+            }
+            QProgressBar::chunk {
+                background-color: #3498DB;
+                border-radius: 2px;
+            }
+        """)
+        
+        # Create network connectivity indicator
+        self.network_indicator = QLabel()
+        self.network_indicator.setFixedSize(16, 16)
+        self.network_indicator.setToolTip("Network connectivity status - Click to test")
+        self.network_indicator.setCursor(Qt.PointingHandCursor)
+        self.network_indicator.setStyleSheet("""
+            QLabel {
+                border: 1px solid #5D6D7E;
+                border-radius: 8px;
+                background-color: #7F8C8D;
+                margin: 2px;
+            }
+        """)
+        
+        # Make network indicator clickable
+        self.network_indicator.mousePressEvent = self.on_network_indicator_clicked
+        
+        # Add widgets to status bar (right side)
+        self.status_bar.addPermanentWidget(self.network_indicator)
+        self.status_bar.addPermanentWidget(self.progress_bar)
+        
+        # Start network monitoring
+        self.check_network_connectivity()
+        
+        # Set up network check timer
+        self.network_timer = QTimer()
+        self.network_timer.timeout.connect(self.check_network_connectivity)
+        self.network_timer.start(30000)  # Check every 30 seconds
+        
         self.status_bar.showMessage("Ready")
     
     def create_menu_bar(self):
@@ -1416,6 +2100,20 @@ class MainWindow(QMainWindow):
         status_guide_action = QAction("&Status Guide", self)
         status_guide_action.triggered.connect(self.show_status_guide)
         help_menu.addAction(status_guide_action)
+        
+        help_menu.addSeparator()
+        
+        # Check for Updates action
+        update_action = QAction("🔄 &Check for Updates", self)
+        update_action.triggered.connect(self.check_app_updates)
+        help_menu.addAction(update_action)
+        
+        # Auto-check updates toggle
+        auto_update_action = QAction("🔄 &Auto-check Updates on Startup", self)
+        auto_update_action.setCheckable(True)
+        auto_update_action.setChecked(self.settings.value("check_updates_on_startup", True, type=bool))
+        auto_update_action.triggered.connect(self.toggle_auto_update_check)
+        help_menu.addAction(auto_update_action)
         
         help_menu.addSeparator()
         
@@ -1558,10 +2256,18 @@ class MainWindow(QMainWindow):
 <h4>🚀 How to Use</h4>
 <ol>
 <li><b>Scan Games:</b> Click "Scan Games" to detect installed GOG games</li>
+<li><b>Deep Scan:</b> Check the "Deep Scan" option for comprehensive searching (slower but finds more games)</li>
 <li><b>Check Updates:</b> Click "Check Updates" to compare with latest versions</li>
 <li><b>View Details:</b> Click on any game to see changelog information</li>
 <li><b>Open Folders:</b> Click on install paths to open game folders</li>
 </ol>
+
+<h4>🔍 Scan Modes</h4>
+<ul>
+<li><b>Quick Scan:</b> Searches common GOG installation directories (fast, ~5-10 seconds)</li>
+<li><b>Deep Scan:</b> Searches all drives and possible game directories (thorough, may take several minutes)</li>
+</ul>
+<p><i>Use Deep Scan if Quick Scan doesn't find all your games, especially if you have games installed in custom locations.</i></p>
 
 <h4>📊 Column Information</h4>
 <ul>
@@ -1646,10 +2352,10 @@ class MainWindow(QMainWindow):
         about_dialog.setWindowTitle("About GOG Games Build ID Checker")
         about_dialog.setIcon(QMessageBox.Information)
         
-        about_text = """
+        about_text = f"""
 <h3>🎮 GOG Games Build ID Checker</h3>
 
-<p><b>Version:</b> 2.0</p>
+<p><b>Version:</b> {APP_VERSION}</p>
 <p><b>Description:</b> A Qt6-based application for checking GOG game updates using build IDs</p>
 
 <h4>✨ Features</h4>
@@ -1684,6 +2390,139 @@ class MainWindow(QMainWindow):
         
         about_dialog.setText(about_text)
         about_dialog.exec()
+    
+    def check_app_updates(self):
+        """Check for application updates from GitHub"""
+        if self.app_update_thread and self.app_update_thread.isRunning():
+            self.log_message("Update check already in progress...")
+            return
+        
+        self.log_message("🔄 Checking for application updates...")
+        self.status_bar.showMessage("Checking for updates...")
+        
+        # Start update check thread
+        self.app_update_thread = AppUpdateCheckThread()
+        self.app_update_thread.update_checked.connect(self.on_app_update_checked)
+        self.app_update_thread.start()
+    
+    def check_app_updates_silent(self):
+        """Check for application updates silently (no UI feedback unless update found)"""
+        if self.app_update_thread and self.app_update_thread.isRunning():
+            return
+        
+        # Start update check thread
+        self.app_update_thread = AppUpdateCheckThread()
+        self.app_update_thread.update_checked.connect(self.on_app_update_checked_silent)
+        self.app_update_thread.start()
+    
+    def on_app_update_checked_silent(self, result):
+        """Handle the result of the silent app update check"""
+        if 'error' in result:
+            # Don't show errors for silent checks
+            return
+        
+        current_version = result.get('current_version', APP_VERSION)
+        latest_version = result.get('latest_version', 'Unknown')
+        update_available = result.get('update_available', False)
+        download_url = result.get('download_url', '')
+        release_notes = result.get('release_notes', '')
+        
+        if update_available:
+            # Only show notification if an update is available
+            self.status_bar.showMessage(f"Update available: v{latest_version} (Check Help menu)")
+            self.show_update_dialog(current_version, latest_version, download_url, release_notes)
+    
+    def on_app_update_checked(self, result):
+        """Handle the result of the app update check"""
+        if 'error' in result:
+            self.log_message(f"❌ Update check failed: {result['error']}")
+            self.status_bar.showMessage("Update check failed")
+            
+            # Show error dialog
+            error_dialog = QMessageBox(self)
+            error_dialog.setWindowTitle("Update Check Failed")
+            error_dialog.setIcon(QMessageBox.Warning)
+            error_dialog.setText(f"Failed to check for updates:\n{result['error']}")
+            error_dialog.exec()
+            return
+        
+        current_version = result.get('current_version', APP_VERSION)
+        latest_version = result.get('latest_version', 'Unknown')
+        update_available = result.get('update_available', False)
+        download_url = result.get('download_url', '')
+        release_notes = result.get('release_notes', '')
+        
+        self.log_message(f"✅ Current version: {current_version}")
+        self.log_message(f"✅ Latest version: {latest_version}")
+        
+        if update_available:
+            self.log_message("🎉 New version available!")
+            self.status_bar.showMessage(f"Update available: v{latest_version}")
+            self.show_update_dialog(current_version, latest_version, download_url, release_notes)
+        else:
+            self.log_message("✅ You have the latest version!")
+            self.status_bar.showMessage("You have the latest version")
+            
+            # Show up-to-date dialog
+            info_dialog = QMessageBox(self)
+            info_dialog.setWindowTitle("No Updates Available")
+            info_dialog.setIcon(QMessageBox.Information)
+            info_dialog.setText(f"You are running the latest version ({current_version}).")
+            info_dialog.exec()
+    
+    def show_update_dialog(self, current_version, latest_version, download_url, release_notes):
+        """Show dialog when an update is available"""
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Update Available")
+        dialog.setIcon(QMessageBox.Information)
+        
+        # Format release notes for display
+        formatted_notes = release_notes.replace('\n', '<br>').replace('\r\n', '<br>')
+        if len(formatted_notes) > 500:
+            formatted_notes = formatted_notes[:500] + "..."
+        
+        update_text = f"""
+<h3>🎉 New Version Available!</h3>
+
+<p><b>Current Version:</b> {current_version}</p>
+<p><b>Latest Version:</b> {latest_version}</p>
+
+<h4>📝 Release Notes:</h4>
+<p style="font-size: 11px; color: #666;">{formatted_notes}</p>
+
+<p>Would you like to download the latest version?</p>
+        """
+        
+        dialog.setText(update_text)
+        dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        dialog.setDefaultButton(QMessageBox.Yes)
+        
+        result = dialog.exec()
+        
+        if result == QMessageBox.Yes and download_url:
+            # Open download URL in default browser
+            try:
+                import webbrowser
+                webbrowser.open(download_url)
+                self.log_message(f"🌐 Opened download page: {download_url}")
+            except Exception as e:
+                self.log_message(f"❌ Failed to open download page: {e}")
+                # Show URL in a dialog as fallback
+                url_dialog = QMessageBox(self)
+                url_dialog.setWindowTitle("Download URL")
+                url_dialog.setIcon(QMessageBox.Information)
+                url_dialog.setText(f"Please visit:\n{download_url}")
+                url_dialog.exec()
+    
+    def toggle_auto_update_check(self):
+        """Toggle automatic update checking on startup"""
+        current_setting = self.settings.value("check_updates_on_startup", True, type=bool)
+        new_setting = not current_setting
+        self.settings.setValue("check_updates_on_startup", new_setting)
+        
+        status_msg = "enabled" if new_setting else "disabled"
+        self.status_bar.showMessage(f"Auto-update check {status_msg}", 2000)
+        self.log_message(f"✅ Auto-update check on startup {status_msg}")
     
     def set_theme(self, theme_name):
         """Set the application theme"""
@@ -2008,9 +2847,56 @@ class MainWindow(QMainWindow):
             # Update title color
             pass  # Colors are updated via main stylesheet
         
+        # Update deep scan checkbox theme
+        if hasattr(self, 'deep_scan_checkbox'):
+            checkbox_style = f"""
+                QCheckBox {{
+                    color: {text_primary};
+                    font-size: 11px;
+                    padding: 5px;
+                }}
+                QCheckBox::indicator {{
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid {border_color};
+                    border-radius: 3px;
+                    background-color: {bg_secondary};
+                }}
+                QCheckBox::indicator:checked {{
+                    background-color: {accent_blue};
+                    border-color: {accent_hover};
+                }}
+                QCheckBox::indicator:checked:hover {{
+                    background-color: {accent_hover};
+                }}
+            """
+            self.deep_scan_checkbox.setStyleSheet(checkbox_style)
+        
         # Update statistics label
         if hasattr(self, 'stats_label'):
             self.stats_label.setStyleSheet(f"color: {text_primary}; font-size: 12px; font-weight: bold;")
+        
+        # Update progress bar theme
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.setStyleSheet(f"""
+                QProgressBar {{
+                    border: 1px solid {border_color};
+                    border-radius: 3px;
+                    background-color: {bg_tertiary};
+                    text-align: center;
+                    font-size: 10px;
+                    color: {text_primary};
+                }}
+                QProgressBar::chunk {{
+                    background-color: {accent_blue};
+                    border-radius: 2px;
+                }}
+            """)
+        
+        # Update network indicator to match theme
+        if hasattr(self, 'network_indicator'):
+            # Trigger a network status recheck to apply theme colors
+            QTimer.singleShot(100, self.check_network_connectivity)
         
         # Force redraw of games display to apply new colors
         if hasattr(self, 'installed_games') and self.installed_games:
@@ -2091,6 +2977,170 @@ class MainWindow(QMainWindow):
         stats_text = f"📊 Total: {total_games} | ✅ Up to Date: {up_to_date} | 🔄 Updates Available: {updates_available}"
         self.stats_label.setText(stats_text)
     
+    def start_progress(self, total_items, operation_name="Processing"):
+        """Start progress tracking"""
+        import time
+        self.progress_start_time = time.time()
+        self.progress_total_items = total_items
+        self.progress_completed_items = 0
+        self.progress_bar.setMaximum(total_items)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"{operation_name}... 0/{total_items}")
+        self.progress_bar.setVisible(True)
+    
+    def update_progress(self, completed_items=None):
+        """Update progress bar with ETA calculation"""
+        if completed_items is not None:
+            self.progress_completed_items = completed_items
+        else:
+            self.progress_completed_items += 1
+        
+        if self.progress_total_items == 0:
+            return
+        
+        # Calculate progress percentage
+        progress_percent = (self.progress_completed_items / self.progress_total_items) * 100
+        self.progress_bar.setValue(self.progress_completed_items)
+        
+        # Calculate ETA only if we have meaningful progress
+        if self.progress_completed_items > 0 and self.progress_start_time:
+            import time
+            elapsed_time = time.time() - self.progress_start_time
+            
+            # Only calculate ETA if we have at least 2 items completed to get a better estimate
+            if self.progress_completed_items >= 2:
+                items_per_second = self.progress_completed_items / elapsed_time
+                remaining_items = self.progress_total_items - self.progress_completed_items
+                
+                if items_per_second > 0 and remaining_items > 0:
+                    eta_seconds = remaining_items / items_per_second
+                    
+                    # Format ETA
+                    if eta_seconds < 60:
+                        eta_text = f"{int(eta_seconds)}s"
+                    elif eta_seconds < 3600:
+                        eta_text = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                    else:
+                        eta_text = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
+                    
+                    # Only update format if it hasn't been set by detailed progress handler
+                    current_format = self.progress_bar.format()
+                    if "Analyzing" not in current_format and "Fetching" not in current_format and "Completed" not in current_format:
+                        format_text = f"{self.progress_completed_items}/{self.progress_total_items} - ETA: {eta_text}"
+                        self.progress_bar.setFormat(format_text)
+                else:
+                    if "Analyzing" not in self.progress_bar.format() and "Fetching" not in self.progress_bar.format():
+                        format_text = f"{self.progress_completed_items}/{self.progress_total_items} - Calculating..."
+                        self.progress_bar.setFormat(format_text)
+            else:
+                if "Analyzing" not in self.progress_bar.format() and "Fetching" not in self.progress_bar.format():
+                    format_text = f"{self.progress_completed_items}/{self.progress_total_items} - Calculating..."
+                    self.progress_bar.setFormat(format_text)
+        
+        # Hide progress bar when complete
+        if self.progress_completed_items >= self.progress_total_items:
+            QTimer.singleShot(2000, self.hide_progress)  # Hide after 2 seconds
+    
+    def hide_progress(self):
+        """Hide the progress bar"""
+        self.progress_bar.setVisible(False)
+        self.progress_start_time = None
+        self.progress_total_items = 0
+        self.progress_completed_items = 0
+        self.current_operation = "idle"
+    
+    def check_network_connectivity(self):
+        """Check network connectivity and update indicator"""
+        try:
+            # Quick connectivity test to a reliable server
+            import socket
+            socket.setdefaulttimeout(3)
+            
+            # Try to connect to Google's DNS server
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect(("8.8.8.8", 53))
+                self.update_network_status(True)
+                
+        except Exception:
+            self.update_network_status(False)
+    
+    def update_network_status(self, is_connected):
+        """Update the network indicator visual status"""
+        if is_connected:
+            # Green indicator for connected
+            color = "#27AE60" if self.current_theme == "dark" else "#16A085"
+            self.network_indicator.setStyleSheet(f"""
+                QLabel {{
+                    border: 1px solid {"#5D6D7E" if self.current_theme == "dark" else "#BDC3C7"};
+                    border-radius: 8px;
+                    background-color: {color};
+                    margin: 2px;
+                }}
+            """)
+            self.network_indicator.setToolTip("🌐 Network connected - Online services available")
+        else:
+            # Red indicator for disconnected
+            color = "#E74C3C" if self.current_theme == "dark" else "#C0392B"
+            self.network_indicator.setStyleSheet(f"""
+                QLabel {{
+                    border: 1px solid {"#5D6D7E" if self.current_theme == "dark" else "#BDC3C7"};
+                    border-radius: 8px;
+                    background-color: {color};
+                    margin: 2px;
+                }}
+            """)
+            self.network_indicator.setToolTip("❌ Network disconnected - Update checking may fail")
+    
+    def on_network_error_detected(self):
+        """Handle network error detection from update thread"""
+        # Immediately recheck network status
+        self.check_network_connectivity()
+        # Show orange indicator for API issues even if general connectivity exists
+        if hasattr(self, 'network_indicator'):
+            color = "#F39C12" if self.current_theme == "dark" else "#E67E22"
+            self.network_indicator.setStyleSheet(f"""
+                QLabel {{
+                    border: 1px solid {"#5D6D7E" if self.current_theme == "dark" else "#BDC3C7"};
+                    border-radius: 8px;
+                    background-color: {color};
+                    margin: 2px;
+                }}
+            """)
+            self.network_indicator.setToolTip("⚠️ Network issues detected - Some API calls may be failing")
+            
+            # Reset to normal status after 10 seconds
+            QTimer.singleShot(10000, self.check_network_connectivity)
+    
+    def on_network_indicator_clicked(self, event):
+        """Handle clicking on the network indicator for manual testing"""
+        # Show testing status
+        self.network_indicator.setStyleSheet(f"""
+            QLabel {{
+                border: 1px solid {"#5D6D7E" if self.current_theme == "dark" else "#BDC3C7"};
+                border-radius: 8px;
+                background-color: #3498DB;
+                margin: 2px;
+            }}
+        """)
+        self.network_indicator.setToolTip("🔄 Testing network connectivity...")
+        self.status_bar.showMessage("Testing network connectivity...")
+        
+        # Perform network test after short delay to show the blue indicator
+        QTimer.singleShot(500, self.perform_manual_network_test)
+    
+    def perform_manual_network_test(self):
+        """Perform manual network connectivity test"""
+        self.check_network_connectivity()
+        
+        # Show result in status bar briefly
+        current_tooltip = self.network_indicator.toolTip()
+        if "connected" in current_tooltip:
+            self.status_bar.showMessage("Network test: Connected ✅", 3000)
+        elif "disconnected" in current_tooltip:
+            self.status_bar.showMessage("Network test: Disconnected ❌", 3000)
+        else:
+            self.status_bar.showMessage("Network test: Issues detected ⚠️", 3000)
+    
     def auto_scan(self):
         """Automatically start scanning on startup"""
         QTimer.singleShot(1000, self.scan_games)  # Delay to allow UI to fully load
@@ -2100,12 +3150,40 @@ class MainWindow(QMainWindow):
         if self.scan_thread and self.scan_thread.isRunning():
             return
         
+        # Check if deep scan is enabled
+        deep_scan_enabled = self.deep_scan_checkbox.isChecked()
+        
+        # Show warning for deep scan
+        if deep_scan_enabled:
+            from PySide6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self, 
+                "Deep Scan Warning",
+                "Deep Scan will search all available drives and common directories for GOG games.\n\n"
+                "This process may take significantly longer (several minutes) but will find games "
+                "installed in non-standard locations.\n\n"
+                "Do you want to continue with Deep Scan?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+        
         self.scan_button.setEnabled(False)
         self.update_button.setEnabled(False)
-        self.status_bar.showMessage("Scanning for games...")
         
-        self.scan_thread = GameScanThread()
+        scan_type = "Deep Scan" if deep_scan_enabled else "Quick Scan"
+        self.status_bar.showMessage(f"Starting {scan_type}...")
+        
+        # Start progress for the entire workflow (scanning + updates)
+        # We'll estimate total items after scanning
+        self.start_progress(1, f"{scan_type} in progress")
+        self.current_operation = "scanning"
+        
+        self.scan_thread = GameScanThread(deep_scan=deep_scan_enabled)
         self.scan_thread.games_found.connect(self.on_games_found)
+        self.scan_thread.scan_progress.connect(self.on_scan_progress)
         self.scan_thread.log_message.connect(self.log_message)
         self.scan_thread.finished.connect(self.on_scan_finished)
         self.scan_thread.start()
@@ -2123,8 +3201,18 @@ class MainWindow(QMainWindow):
         self.scan_button.setEnabled(False)
         self.status_bar.showMessage("Checking for updates...")
         
+        # Continue existing progress or start new if called independently
+        if self.current_operation not in ["preparing_updates", "scanning"]:
+            # Called independently (not from scan), start fresh progress
+            self.start_progress(len(self.installed_games), "Checking updates")
+        else:
+            # Continue from scanning phase
+            self.current_operation = "updating"
+        
         self.update_thread = UpdateCheckThread(self.installed_games)
         self.update_thread.update_progress.connect(self.on_update_progress)
+        self.update_thread.progress_update.connect(self.on_detailed_progress_unified)
+        self.update_thread.network_error_detected.connect(self.on_network_error_detected)
         self.update_thread.log_message.connect(self.log_message)
         self.update_thread.finished.connect(self.on_update_finished)
         self.update_thread.start()
@@ -2146,7 +3234,7 @@ class MainWindow(QMainWindow):
         
         if galaxy_path:
             try:
-                subprocess.Popen([galaxy_path])
+                subprocess.Popen([galaxy_path], creationflags=subprocess.CREATE_NO_WINDOW)
                 self.log_message("🎮 GOG Galaxy launched successfully")
                 self.status_bar.showMessage("GOG Galaxy opened")
             except Exception as e:
@@ -2156,6 +3244,12 @@ class MainWindow(QMainWindow):
             self.log_message("❌ GOG Galaxy not found")
             QMessageBox.information(self, "GOG Galaxy Not Found", 
                                   "GOG Galaxy is not installed or could not be found.")
+    
+    def on_scan_progress(self, status_text):
+        """Handle scan progress updates"""
+        if self.current_operation == "scanning":
+            self.status_bar.showMessage(status_text)
+            self.progress_bar.setFormat(f"1/? - {status_text}")
     
     def on_games_found(self, games):
         """Handle games found signal"""
@@ -2168,11 +3262,118 @@ class MainWindow(QMainWindow):
         self.scan_button.setEnabled(True)
         if self.installed_games:
             self.update_button.setEnabled(True)
-        self.status_bar.showMessage("Scan completed")
         
-        # Auto-start update checking
+        # Transition to update checking phase
         if self.installed_games:
-            QTimer.singleShot(2000, self.check_updates)
+            # Update progress tracking for the update phase
+            total_operations = 1 + len(self.installed_games)  # 1 for scan + games for updates
+            self.progress_total_items = total_operations
+            self.progress_completed_items = 1  # Scanning is done
+            self.progress_bar.setMaximum(total_operations)
+            self.progress_bar.setValue(1)
+            self.current_operation = "preparing_updates"
+            
+            self.status_bar.showMessage("Scan completed, preparing to check updates...")
+            self.progress_bar.setFormat(f"1/{total_operations} - Scan complete, starting updates...")
+            
+            # Auto-start update checking
+            QTimer.singleShot(1000, self.check_updates)
+        else:
+            # No games found, complete the progress
+            self.update_progress(1)
+            self.status_bar.showMessage("Scan completed - no games found")
+    
+    def on_detailed_progress_unified(self, update_completed_count, status_text):
+        """Handle detailed progress updates from the update thread (unified workflow)"""
+        # Calculate total progress: 1 (scan) + update_completed_count
+        total_completed = 1 + update_completed_count
+        
+        # Update progress bar values
+        self.progress_completed_items = total_completed
+        self.progress_bar.setValue(total_completed)
+        
+        # Calculate ETA if we have enough data
+        eta_text = ""
+        if total_completed >= 2 and self.progress_start_time:
+            import time
+            elapsed_time = time.time() - self.progress_start_time
+            items_per_second = total_completed / elapsed_time
+            remaining_items = self.progress_total_items - total_completed
+            
+            if items_per_second > 0 and remaining_items > 0:
+                eta_seconds = remaining_items / items_per_second
+                
+                # Format ETA
+                if eta_seconds < 60:
+                    eta_text = f" - ETA: {int(eta_seconds)}s"
+                elif eta_seconds < 3600:
+                    eta_text = f" - ETA: {int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    eta_text = f" - ETA: {int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
+        
+        # Update progress bar format with current operation and ETA
+        if hasattr(self, 'progress_bar') and self.progress_bar.isVisible():
+            format_text = f"{total_completed}/{self.progress_total_items}{eta_text}"
+            self.progress_bar.setFormat(format_text)
+        
+        # Update status bar with current operation
+        if total_completed < self.progress_total_items:
+            self.status_bar.showMessage(f"{status_text}")
+        else:
+            self.status_bar.showMessage("All operations completed")
+            
+        # Auto-hide when complete
+        if total_completed >= self.progress_total_items:
+            QTimer.singleShot(2000, self.hide_progress)
+    
+    def on_detailed_progress(self, completed_count, status_text):
+        """Handle detailed progress updates from the update thread (standalone)"""
+        # This is for when update checking is called independently
+        if self.current_operation == "updating" and self.progress_total_items > len(self.installed_games):
+            # Use unified handler
+            self.on_detailed_progress_unified(completed_count, status_text)
+            return
+        
+        # Store the original completed items
+        original_completed = self.progress_completed_items
+        
+        # Update progress bar values
+        self.progress_completed_items = completed_count
+        self.progress_bar.setValue(completed_count)
+        
+        # Calculate ETA if we have enough data
+        eta_text = ""
+        if self.progress_completed_items >= 2 and self.progress_start_time:
+            import time
+            elapsed_time = time.time() - self.progress_start_time
+            items_per_second = self.progress_completed_items / elapsed_time
+            remaining_items = self.progress_total_items - self.progress_completed_items
+            
+            if items_per_second > 0 and remaining_items > 0:
+                eta_seconds = remaining_items / items_per_second
+                
+                # Format ETA
+                if eta_seconds < 60:
+                    eta_text = f" - ETA: {int(eta_seconds)}s"
+                elif eta_seconds < 3600:
+                    eta_text = f" - ETA: {int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                else:
+                    eta_text = f" - ETA: {int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m"
+        
+        # Update progress bar format with current operation and ETA
+        if hasattr(self, 'progress_bar') and self.progress_bar.isVisible():
+            format_text = f"{completed_count}/{self.progress_total_items}{eta_text}"
+            self.progress_bar.setFormat(format_text)
+        
+        # Update status bar with current operation
+        if completed_count < self.progress_total_items:
+            self.status_bar.showMessage(f"{status_text}")
+        else:
+            self.status_bar.showMessage("Update check completed")
+            
+        # Auto-hide when complete
+        if completed_count >= self.progress_total_items:
+            QTimer.singleShot(2000, self.hide_progress)
     
     def on_update_progress(self, game):
         """Handle update progress signal"""
@@ -2209,7 +3410,7 @@ class MainWindow(QMainWindow):
         self.games_tree.clear()
         
         if not self.installed_games:
-            item = QTreeWidgetItem(["No GOG games found", "", "", "Not scanned", "", "", "", ""])
+            item = QTreeWidgetItem(["No GOG games found", "", "", "", "Not scanned", "", "", "", ""])
             self.games_tree.addTopLevelItem(item)
             # Reconnect signal
             self.games_tree.itemSelectionChanged.connect(self.on_game_selected)
@@ -2235,6 +3436,7 @@ class MainWindow(QMainWindow):
         
         for game in self.installed_games:
             name = game.get('name', 'Unknown Game')
+            readable_version = game.get('readable_version', '-')
             installed_version = game.get('installed_version', 'Unknown')
             latest_version = game.get('latest_version', 'Checking...')
             status = game.get('update_status', 'Unknown')
@@ -2255,7 +3457,7 @@ class MainWindow(QMainWindow):
             is_dlc = any(dlc_keyword in name.lower() for dlc_keyword in [' - ', ': ', ' dlc', ' expansion', ' pack'])
             wiki_value = "📚" if not is_dlc else ""
             
-            item = QTreeWidgetItem([name, installed_version, latest_version, status, size, tags_value, path, wiki_value])
+            item = QTreeWidgetItem([name, readable_version, installed_version, latest_version, status, size, tags_value, path, wiki_value])
             
             # Get theme-appropriate colors
             if self.current_theme == "light":
@@ -2270,24 +3472,24 @@ class MainWindow(QMainWindow):
                 path_color = QColor(236, 240, 241)  # Light text for path
             
             # Style tags column (normal text, not clickable)
-            item.setForeground(5, tags_color)
-            item.setToolTip(5, f"Game Tags: {tags_value}")
+            item.setForeground(6, tags_color)
+            item.setToolTip(6, f"Game Tags: {tags_value}")
             
-            # Style wiki column (only clickable for main games) - now column 7
+            # Style wiki column (only clickable for main games) - now column 8
             if not is_dlc:
-                item.setForeground(7, wiki_color)
-                item.setToolTip(7, f"📚 Click to open PCGamingWiki page for: {name}")
+                item.setForeground(8, wiki_color)
+                item.setToolTip(8, f"📚 Click to open PCGamingWiki page for: {name}")
                 # Make wiki column look clickable
-                font = item.font(7)
+                font = item.font(8)
                 font.setUnderline(True)
-                item.setFont(7, font)
+                item.setFont(8, font)
             else:
-                item.setForeground(7, wiki_disabled_color)
-                item.setToolTip(7, "Wiki not available for DLC/Expansions")
+                item.setForeground(8, wiki_disabled_color)
+                item.setToolTip(8, "Wiki not available for DLC/Expansions")
             
-            # Install path as plain text (no longer clickable) - now column 6
-            item.setForeground(6, path_color)
-            item.setToolTip(6, f"Install Path: {game.get('install_path', 'Unknown')}")
+            # Install path as plain text (no longer clickable) - now column 7
+            item.setForeground(7, path_color)
+            item.setToolTip(7, f"Install Path: {game.get('install_path', 'Unknown')}")
             
             # Add visual distinction for duplicates - BRIGHT background colors only
             if is_duplicate:
@@ -2302,7 +3504,7 @@ class MainWindow(QMainWindow):
                     duplicate_color = QColor(255, 140, 0, 120)   # Orange
                 
                 # Apply the bright background to ALL columns
-                for i in range(8):
+                for i in range(9):
                     item.setBackground(i, duplicate_color)
             
             # Color code by status and make status clickable (only for updates)
@@ -2324,35 +3526,35 @@ class MainWindow(QMainWindow):
                 
                 if status == 'Update Available':
                     # Set red color for status text and make it look like a link
-                    item.setForeground(3, update_text_color)
-                    item.setToolTip(3, "🌐 Click to open this game on gog-games.to")
+                    item.setForeground(4, update_text_color)
+                    item.setToolTip(4, "🌐 Click to open this game on gog-games.to")
                     # Make status text bold and underlined to look like a link
-                    font = item.font(3)
+                    font = item.font(4)
                     font.setBold(True)
                     font.setUnderline(True)
-                    item.setFont(3, font)
+                    item.setFont(4, font)
                     # Light red background for the entire row
-                    for i in range(8):
+                    for i in range(9):
                         item.setBackground(i, update_bg_color)
                 elif status == 'Up to Date':
                     # Set green color for status text (not clickable)
-                    item.setForeground(3, success_text_color)
+                    item.setForeground(4, success_text_color)
                     # Light green background for the entire row
-                    for i in range(8):
+                    for i in range(9):
                         item.setBackground(i, success_bg_color)
                 elif status.startswith('Cannot Check'):
                     # Yellow background
-                    for i in range(8):
+                    for i in range(9):
                         item.setBackground(i, warning_bg_color)
             else:
                 # For duplicates, still make the status text clickable but keep duplicate background
                 if status == 'Update Available':
-                    item.setForeground(3, QColor(255, 255, 255))  # White text for visibility on colored background
-                    item.setToolTip(3, "🌐 Click to open this game on gog-games.to")
-                    font = item.font(3)
+                    item.setForeground(4, QColor(255, 255, 255))  # White text for visibility on colored background
+                    item.setToolTip(4, "🌐 Click to open this game on gog-games.to")
+                    font = item.font(4)
                     font.setBold(True)
                     font.setUnderline(True)
-                    item.setFont(3, font)
+                    item.setFont(4, font)
             
 
             
@@ -2453,9 +3655,9 @@ class MainWindow(QMainWindow):
         return formatted
     
     def on_item_clicked(self, item, column):
-        """Handle item clicks - open specific game page on gog-games.to if status column is clicked, or PCGamingWiki if tags column is clicked"""
-        if column == 3:  # Status column
-            status = item.text(3)
+        """Handle item clicks - open specific game page on gog-games.to if status column is clicked, or PCGamingWiki if wiki column is clicked"""
+        if column == 4:  # Status column (moved from 3 to 4)
+            status = item.text(4)
             if status == 'Update Available':  # Only for updates, not "Up to Date"
                 import webbrowser
                 
@@ -2473,9 +3675,9 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"❌ Failed to open gog-games.to: {str(e)}")
         
-        elif column == 7:  # Wiki column (now last column)
+        elif column == 8:  # Wiki column (moved from 7 to 8)
             game_name = item.text(0)
-            wiki_text = item.text(7)
+            wiki_text = item.text(8)
             
             # Only allow wiki opening for main games (has 📚 icon)
             if wiki_text == "📚":
@@ -2494,15 +3696,15 @@ class MainWindow(QMainWindow):
     
     def on_mouse_enter_item(self, index):
         """Change cursor when hovering over clickable columns"""
-        if index.column() == 3:  # Status column
+        if index.column() == 4:  # Status column (moved from 3 to 4)
             item = self.games_tree.itemFromIndex(index)
-            if item and item.text(3) == 'Update Available':  # Only for updates, not "Up to Date"
+            if item and item.text(4) == 'Update Available':  # Only for updates, not "Up to Date"
                 self.games_tree.setCursor(Qt.PointingHandCursor)
             else:
                 self.games_tree.setCursor(Qt.ArrowCursor)
-        elif index.column() == 7:  # Wiki column (now last column)
+        elif index.column() == 8:  # Wiki column (moved from 7 to 8)
             item = self.games_tree.itemFromIndex(index)
-            if item and item.text(7) == "📚":  # Only for main games with wiki icon
+            if item and item.text(8) == "📚":  # Only for main games with wiki icon
                 self.games_tree.setCursor(Qt.PointingHandCursor)
             else:
                 self.games_tree.setCursor(Qt.ArrowCursor)

@@ -78,11 +78,20 @@ Each build creates:
 
 ## Current Version
 
-- **Version**: 1.0.0
-- **Build Name**: GOGChecker-v1.0.0
-- **Features**: Auto-sized columns, separated wiki, horizontal scrolling
+- **Version**: 1.2.0
+- **Build Name**: GOGChecker-v1.2.0
+- **Features**: Deep Scan mode, readable version column, enhanced game detection
 
 ## Version History
+
+### v1.2.0 (2025-01-02)
+- 🔍 **Deep Scan Mode**: Optional comprehensive directory scanning across all drives
+- 📋 **Readable Version Column**: Added separate column for user-friendly version numbers (1.2.3)
+- 🚀 **Enhanced Game Detection**: Finds games in custom/non-standard installation locations
+- 🔧 **Fixed PowerShell Windows**: Eliminated random console windows during scanning
+- 💾 **Better Performance**: Smart caching and optimized directory traversal
+- 🎨 **Improved UI**: Two-row layout with better organization of scan options
+- ⚠️ **User Warnings**: Clear notifications about Deep Scan time requirements
 
 ### v1.0.0 (2025-01-02)
 - ✅ Separated Tags and Wiki into different columns
