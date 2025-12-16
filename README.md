@@ -1,6 +1,8 @@
 # GOG Games Build ID Checker
 
-A modern Qt6 GUI application to detect installed GOG games on your PC and check them for updates using build IDs from the gog-games.to API.
+A modern Qt6 GUI application to detect installed GOG games on your PC and check them for updates using build IDs from the `gog-games.to` API.
+
+
 <img width="1747" height="1088" alt="{8E2FE143-F673-4CFB-AD4F-2A756CA96218}" src="https://github.com/user-attachments/assets/fb89f75a-7876-48a5-ba87-35ec37d48e5f" />
 
 ## Features
